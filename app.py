@@ -1,0 +1,330 @@
+import streamlit as st
+import requests
+from datetime import datetime, timedelta, timezone
+
+# ==========================================
+# 1. YOUTUBE API KEY
+# ==========================================
+API_KEY = "AIzaSyDdWrRJvW3LDwg1aOJnyaOnIzJJSCzsHOY"
+
+# ==========================================
+# 2. YOUTUBE API URLS
+# ==========================================
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_VIDEO_URL = "https://www.googleapis.com/youtube/v3/videos"
+YOUTUBE_CHANNEL_URL = "https://www.googleapis.com/youtube/v3/channels"
+
+# ==========================================
+# 3. STREAMLIT APP
+# ==========================================
+st.set_page_config(
+    page_title="YouTube Viral Topics Tool",
+    page_icon=" ",
+    layout="wide"
+)
+
+st.title("YouTube Viral Topics Tool")
+st.write("Find recent YouTube videos from smaller channels.")
+
+days = st.number_input(
+    "Enter Days to Search (1-30):",
+    min_value=1,
+    max_value=30,
+    value=5,
+    step=1
+)
+
+subscriber_limit = st.number_input(
+    "Maximum Channel Subscribers:",
+    min_value=1,
+    max_value=10000000,
+    value=3000,
+    step=500
+)
+
+max_results = st.slider(
+    "Videos per Keyword:",
+    min_value=5,
+    max_value=50,
+    value=10,
+    step=5
+)
+
+keywords_text = st.text_area(
+    "Search Keywords (one per line)",
+    value="""automotive
+car
+car seat cover
+electric vehicles
+luxury car
+car interior
+BMW
+EV
+Rolls-Royce""",
+    height=180
+)
+
+keywords = list(dict.fromkeys(
+    line.strip()
+    for line in keywords_text.splitlines()
+    if line.strip()
+))
+
+
+# ==========================================
+# 4. API REQUEST HELPER
+# ==========================================
+def youtube_get(url, params):
+    response = requests.get(
+        url,
+        params=params,
+        timeout=30
+    )
+
+    try:
+        data = response.json()
+    except ValueError:
+        response.raise_for_status()
+        raise RuntimeError("YouTube returned an invalid response.")
+
+    if not response.ok or "error" in data:
+        error = data.get("error", {})
+        message = error.get(
+            "message",
+            f"HTTP error {response.status_code}"
+        )
+        raise RuntimeError(message)
+
+    return data
+
+
+# ==========================================
+# 5. FETCH VIDEO DATA
+# ==========================================
+def fetch_videos(keyword, published_after):
+    search_data = youtube_get(
+        YOUTUBE_SEARCH_URL,
+        {
+            "part": "snippet",
+            "q": keyword,
+            "type": "video",
+            "order": "viewCount",
+            "publishedAfter": published_after,
+            "maxResults": int(max_results),
+            "key": API_KEY
+        }
+    )
+
+    videos = search_data.get("items", [])
+
+    if not videos:
+        return []
+
+    video_ids = []
+    channel_ids = []
+    snippets = {}
+
+    for video in videos:
+        video_id = video.get("id", {}).get("videoId")
+        snippet = video.get("snippet", {})
+        channel_id = snippet.get("channelId")
+
+        if video_id:
+            snippets[video_id] = snippet
+            video_ids.append(video_id)
+
+        if channel_id and channel_id not in channel_ids:
+            channel_ids.append(channel_id)
+
+    if not video_ids or not channel_ids:
+        return []
+
+    # Fetch video statistics
+    stats_data = youtube_get(
+        YOUTUBE_VIDEO_URL,
+        {
+            "part": "statistics",
+            "id": ",".join(video_ids),
+            "key": API_KEY
+        }
+    )
+
+    video_stats = {
+        item["id"]: item.get("statistics", {})
+        for item in stats_data.get("items", [])
+    }
+
+    # Fetch channel statistics
+    channel_data = youtube_get(
+        YOUTUBE_CHANNEL_URL,
+        {
+            "part": "statistics",
+            "id": ",".join(channel_ids),
+            "key": API_KEY
+        }
+    )
+
+    channel_stats = {
+        item["id"]: item.get("statistics", {})
+        for item in channel_data.get("items", [])
+    }
+
+    results = []
+
+    for video_id, snippet in snippets.items():
+        channel_id = snippet.get("channelId")
+        stats = video_stats.get(video_id)
+        channel = channel_stats.get(channel_id, {})
+
+        if not stats:
+            continue
+
+        # Skip channels with hidden subscriber counts
+        if "subscriberCount" not in channel:
+            continue
+
+        subscribers = int(channel["subscriberCount"])
+
+        if subscribers >= int(subscriber_limit):
+            continue
+
+        results.append({
+            "Title": snippet.get("title", "N/A"),
+            "Channel": snippet.get("channelTitle", "N/A"),
+            "Description": snippet.get("description", "")[:250],
+            "URL": f"https://www.youtube.com/watch?v={video_id}",
+            "Views": int(stats.get("viewCount", 0)),
+            "Subscribers": subscribers,
+            "Keyword": keyword,
+            "Published": snippet.get("publishedAt", "")[:10]
+        })
+
+    return results
+
+
+# ==========================================
+# 6. FETCH DATA BUTTON
+# ==========================================
+if st.button("Fetch YouTube Data", type="primary"):
+
+    if not API_KEY or API_KEY == "PASTE_YOUR_NEW_API_KEY_HERE":
+        st.error(
+            "Please add your YouTube API key at the top of the code."
+        )
+        st.stop()
+
+    if not keywords:
+        st.error("Please enter at least one keyword.")
+        st.stop()
+
+    published_after = (
+        datetime.now(timezone.utc)
+        - timedelta(days=int(days))
+    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    all_results = {}
+    errors = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    try:
+        for index, keyword in enumerate(keywords):
+            status.write(f"Searching: {keyword}")
+
+            try:
+                results = fetch_videos(
+                    keyword,
+                    published_after
+                )
+
+                for result in results:
+                    all_results[result["URL"]] = result
+
+            except (
+                RuntimeError,
+                requests.exceptions.RequestException
+            ) as error:
+                errors.append(f"{keyword}: {error}")
+
+            progress.progress(
+                (index + 1) / len(keywords)
+            )
+
+        status.empty()
+        progress.empty()
+
+        final_results = sorted(
+            all_results.values(),
+            key=lambda item: item["Views"],
+            reverse=True
+        )
+
+        if errors:
+            with st.expander("API warnings and errors"):
+                for error in errors:
+                    st.write(error)
+
+        if final_results:
+            st.success(
+                f"Found {len(final_results)} videos."
+            )
+
+            st.metric("Videos Found", len(final_results))
+
+            import pandas as pd
+
+            df = pd.DataFrame(final_results)
+
+            st.download_button(
+                "Download Results as CSV",
+                data=df.to_csv(
+                    index=False
+                ).encode("utf-8-sig"),
+                file_name="youtube_viral_topics.csv",
+                mime="text/csv"
+            )
+
+            for result in final_results:
+                with st.container(border=True):
+                    st.subheader(result["Title"])
+
+                    st.write(
+                        f"**Channel:** {result['Channel']}"
+                    )
+
+                    col1, col2 = st.columns(2)
+
+                    col1.metric(
+                        "Views",
+                        f"{result['Views']:,}"
+                    )
+
+                    col2.metric(
+                        "Subscribers",
+                        f"{result['Subscribers']:,}"
+                    )
+
+                    st.write(
+                        f"**Published:** {result['Published']}"
+                    )
+
+                    st.write(result["Description"])
+
+                    st.markdown(
+                        f"[Watch Video]({result['URL']})"
+                    )
+
+        else:
+            st.warning(
+                "No qualifying videos found. Try different keywords "
+                "or increase the search period."
+            )
+
+    except Exception as error:
+        st.error(f"An error occurred: {error}")
+
+st.caption(
+    "Results depend on YouTube API quota and data availability. "
+    "High views do not guarantee future virality."
+)
